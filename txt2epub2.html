@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>TXT→EPUB（自定义章节规则）</title>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/file-saver@2.0.5/dist/FileSaver.min.js"></script>
+<style>
+  body{font-family: -apple-system,Helvetica,Arial; max-width:700px;margin:20px auto;padding:16px;}
+  h1{text-align:center;}
+  label{display:block;margin:10px 0 6px;}
+  input[type="file"],input[type="text"]{width:100%;}
+  button{margin:8px 4px;padding:6px 12px;background:#0c64f2;border:none;color:#fff;border-radius:6px;}
+  #status{margin-top:12px;}
+  #err{margin-top:8px;color:#b00020;white-space:pre-wrap;}
+  progress{width:100%;height:14px;margin-top:10px;}
+  #preview{margin-top:15px;padding:10px;border:1px solid #ccc;background:#fafafa;}
+</style>
+</head>
+<body>
+  <h1>TXT → EPUB</h1>
+
+  <label>书名：<input id="bookTitle" type="text" value="我的小说" /></label>
+
+  <label>章节识别规则（正则表达式）：</label>
+  <input id="regexInput" type="text" 
+    value="^(?:第[一二三四五六七八九十百千0-9]+[章节回卷篇]|番外|[0-9]{1,4}$)" />
+
+  <label>选择 TXT 文件：</label>
+  <input id="fileInput" type="file" accept=".txt,text/plain" />
+
+  <div>
+    <button id="previewBtn" disabled>重新预览</button>
+    <button id="convertBtn" disabled>转换并下载 EPUB</button>
+  </div>
+
+  <progress id="progress" value="0" max="100"></progress>
+  <div id="status">脚本加载中…</div>
+  <div id="err"></div>
+
+  <div id="preview" style="display:none;">
+    <b>前 5 章：</b>
+    <ol id="previewList"></ol>
+    <div id="chapterCount"></div>
+  </div>
+
+<script>
+(function(){
+  const fileInput = document.getElementById('fileInput');
+  const regexInput = document.getElementById('regexInput');
+  const previewBtn = document.getElementById('previewBtn');
+  const convertBtn = document.getElementById('convertBtn');
+  const progressEl = document.getElementById('progress');
+  const statusEl = document.getElementById('status');
+  const errEl = document.getElementById('err');
+  const previewDiv = document.getElementById('preview');
+  const previewList = document.getElementById('previewList');
+  const chapterCountEl = document.getElementById('chapterCount');
+  const titleInput = document.getElementById('bookTitle');
+
+  let chaptersCache = [];
+  let lastText = '';
+
+  function updateStatus(p, txt){
+    if (typeof p === 'number') progressEl.value = p;
+    if (txt) statusEl.textContent = txt;
+  }
+  function showError(e){
+    errEl.textContent = e.message || String(e);
+  }
+
+  function splitChapters(text, pattern){
+    const re = new RegExp(pattern,'m');
+    const lines = text.split(/\r?\n/);
+    const idxs = [];
+    for (let i=0;i<lines.length;i++){
+      if (re.test(lines[i].trim())) idxs.push(i);
+    }
+    const result = [];
+    if (idxs.length===0){
+      result.push({title:'全文',content:text});
+      return result;
+    }
+    for (let i=0;i<idxs.length;i++){
+      const start = idxs[i];
+      const end = (i+1<idxs.length) ? idxs[i+1] : lines.length;
+      const titleLine = lines[start].trim();
+      const body = lines.slice(start+1,end).join('\n').trim();
+      result.push({title:titleLine||('第'+(i+1)+'章'), content:body});
+    }
+    return result;
+  }
+
+  async function handleText(text){
+    try{
+      const pattern = regexInput.value.trim();
+      if (!pattern) throw new Error('正则规则不能为空');
+      chaptersCache = splitChapters(text, pattern);
+      previewList.innerHTML='';
+      chaptersCache.slice(0,5).forEach(ch=>{
+        const li=document.createElement('li'); li.textContent=ch.title; previewList.appendChild(li);
+      });
+      chapterCountEl.textContent='共解析到 '+chaptersCache.length+' 章';
+      previewDiv.style.display='block';
+      convertBtn.disabled=false; previewBtn.disabled=false;
+      updateStatus(50,'解析完成，可以转换');
+    }catch(e){showError(e);}
+  }
+
+  fileInput.addEventListener('change',function(){
+    errEl.textContent='';
+    previewDiv.style.display='none';
+    const f=this.files[0]; if(!f)return;
+    updateStatus(10,'读取 TXT 文件…');
+    const fr=new FileReader();
+    fr.onload=function(ev){
+      lastText=ev.target.result;
+      updateStatus(30,'解析中…');
+      handleText(lastText);
+    };
+    fr.onerror=function(){showError(new Error('文件读取失败'))};
+    fr.readAsText(f,'utf-8');
+  });
+
+  previewBtn.addEventListener('click',function(){
+    if(lastText) handleText(lastText);
+  });
+
+  convertBtn.addEventListener('click', async function(){
+    if (!chaptersCache.length) return alert('没有章节数据');
+    updateStatus(60,'生成 EPUB…');
+    const zip=new JSZip();
+    zip.file('mimetype','application/epub+zip',{compression:'STORE'});
+    zip.folder('META-INF').file('container.xml',
+      `<?xml version="1.0"?>
+      <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+        <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+      </container>`
+    );
+    const title=titleInput.value||'未命名';
+    const ncx=`<?xml version="1.0" encoding="utf-8"?>
+    <ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+      <head><meta name="dtb:uid" content="id"/></head>
+      <docTitle><text>${title}</text></docTitle>
+      <navMap>${chaptersCache.map((c,i)=>`
+        <navPoint id="nav${i}" playOrder="${i+1}">
+          <navLabel><text>${c.title}</text></navLabel>
+          <content src="chapter${i}.xhtml"/>
+        </navPoint>`).join('')}
+      </navMap>
+    </ncx>`;
+    zip.folder('OEBPS').file('toc.ncx',ncx);
+    const opf=`<?xml version="1.0" encoding="utf-8"?>
+    <package version="2.0" unique-identifier="id" xmlns="http://www.idpf.org/2007/opf">
+      <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+        <dc:title>${title}</dc:title>
+        <dc:language>zh</dc:language>
+        <dc:identifier id="id">id</dc:identifier>
+      </metadata>
+      <manifest>
+        <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+        ${chaptersCache.map((_,i)=>`<item id="chap${i}" href="chapter${i}.xhtml" media-type="application/xhtml+xml"/>`).join('')}
+      </manifest>
+      <spine toc="ncx">
+        ${chaptersCache.map((_,i)=>`<itemref idref="chap${i}"/>`).join('')}
+      </spine>
+    </package>`;
+    zip.folder('OEBPS').file('content.opf',opf);
+    chaptersCache.forEach((ch,i)=>{
+      const body=(ch.content||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br/>');
+      const xhtml=`<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>${ch.title}</title></head>
+<body><h2><b>${ch.title}</b></h2><div>${body}</div></body></html>`;
+      zip.folder('OEBPS').file(`chapter${i}.xhtml`,xhtml);
+    });
+    const blob=await zip.generateAsync({type:'blob'});
+    saveAs(blob,title+'.epub');
+    updateStatus(100,'完成！EPUB 已下载');
+  });
+})();
+</script>
+</body>
+</html>
