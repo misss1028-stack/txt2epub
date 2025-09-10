@@ -3,193 +3,302 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>TXT 转 EPUB</title>
+<title>TXT→EPUB（Safari 修复版）</title>
+
+<!-- 先引入依赖（必须位于我们脚本之前） -->
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/file-saver@2.0.5/dist/FileSaver.min.js"></script>
+
 <style>
-body{font-family:-apple-system,Segoe UI,Roboto,PingFang SC,Helvetica,Arial,sans-serif;padding:20px;background:#f6f7f9;}
-h2{margin-top:0;}
-label{display:block;margin-top:10px;font-size:14px;color:#333;}
-input[type="file"],input[type="text"],textarea{margin-top:5px;padding:8px;width:100%;max-width:600px;}
-button{margin-top:15px;margin-right:10px;padding:10px 20px;background:#0c64f2;color:#fff;border:none;border-radius:6px;cursor:pointer;font-weight:600;}
-button:disabled{background:#ccc;cursor:not-allowed;}
-progress{width:100%;height:14px;margin-top:10px;}
-pre{background:#fff;padding:10px;border-radius:6px;max-height:300px;overflow:auto;}
+  body{font-family: -apple-system,Helvetica,Arial; max-width:700px;margin:20px auto;padding:16px;}
+  h1{font-size:18px;text-align:center;}
+  label{display:block;margin:10px 0 6px;}
+  input[type="file"]{display:block;}
+  button{margin-top:12px;padding:8px 14px;background:#0c64f2;border:none;color:#fff;border-radius:8px;}
+  #status{margin-top:12px;color:#333;}
+  #err{margin-top:8px;color:#b00020;white-space:pre-wrap;}
+  progress{width:100%;height:14px;margin-top:10px;}
 </style>
 </head>
 <body>
-<h2>TXT 转 EPUB</h2>
+  <h1>TXT → EPUB（Safari 修复）</h1>
 
-<label>选择 TXT 文件：
+  <label>书名：<input id="bookTitle" type="text" value="我的小说" /></label>
+  <label>选择 TXT 文件（必须通过此上传）：</label>
   <input id="fileInput" type="file" accept=".txt,text/plain" />
-</label>
+  <div>
+    <button id="previewBtn" disabled>预览前 5 章</button>
+    <button id="convertBtn" disabled>转换并下载 EPUB</button>
+  </div>
 
-<label>书名：
-  <input id="titleInput" type="text" placeholder="默认文件名" />
-</label>
+  <progress id="progress" value="0" max="100"></progress>
+  <div id="status">脚本加载中…（页面加载后应显示 “脚本就绪”）</div>
+  <div id="err"></div>
 
-<label>作者：
-  <input id="authorInput" type="text" placeholder="可留空" />
-</label>
-
-<label>章节识别规则（逗号分隔，支持正则表达式）：</label>
-<textarea id="rulesInput" rows="3">第[一二三四五六七八九十百千0-9]+[章节回卷篇],番外,^[0-9]{1,4}$</textarea>
-
-<button id="testBtn" disabled>测试规则</button>
-<button id="convertBtn" disabled>转换并下载</button>
-
-<progress id="progress" value="0" max="100"></progress>
-<div id="status">等待中…</div>
-
-<pre id="preview"></pre>
-
-<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <div id="preview" style="display:none;margin-top:12px;border:1px solid #eee;padding:8px;background:#fafafa;">
+    <b>前 5 章：</b>
+    <ol id="previewList"></ol>
+    <div id="chapterCount"></div>
+  </div>
 
 <script>
-const fileInput=document.getElementById('fileInput');
-const convertBtn=document.getElementById('convertBtn');
-const testBtn=document.getElementById('testBtn');
-const titleInput=document.getElementById('titleInput');
-const authorInput=document.getElementById('authorInput');
-const rulesInput=document.getElementById('rulesInput');
-const preview=document.getElementById('preview');
-const progress=document.getElementById('progress');
-const status=document.getElementById('status');
+(function(){
+  const statusEl = document.getElementById('status');
+  const errEl = document.getElementById('err');
+  const fileInput = document.getElementById('fileInput');
+  const previewBtn = document.getElementById('previewBtn');
+  const convertBtn = document.getElementById('convertBtn');
+  const progressEl = document.getElementById('progress');
+  const previewDiv = document.getElementById('preview');
+  const previewList = document.getElementById('previewList');
+  const chapterCountEl = document.getElementById('chapterCount');
+  const titleInput = document.getElementById('bookTitle');
 
-let decodedText='', chapters=[];
+  // Quick health check to see if required libs loaded
+  if (typeof JSZip === 'undefined' || typeof saveAs === 'undefined') {
+    statusEl.textContent = '错误：依赖未加载（JSZip 或 FileSaver 未定义）。请检查网络或 CDN 被阻止。';
+    errEl.textContent = '如果你在公司/学校网络或启用了广告拦截，尝试换网或允许 cdn.jsdelivr.net。';
+    return;
+  }
 
-// 📖 文件选择
-fileInput.addEventListener('change', e=>{
-  const f=e.target.files[0];if(!f)return;
-  status.textContent='正在读取文件…';
-  progress.value=5;
+  statusEl.textContent = '脚本就绪（请在下方选择 TXT 文件）';
+  progressEl.value = 0;
 
-  // 用 FileReader（更兼容大文件）
-  const reader=new FileReader();
-  reader.onload=function(ev){
-    let text=ev.target.result;
-    if(!text || text.trim()===''){ 
-      // 如果 UTF-8 失败，再试 GBK
-      const fr2=new FileReader();
-      fr2.onload=function(ev2){
-        decodedText=ev2.target.result;
-        afterLoad(f);
+  let chaptersCache = null;
+  let lastText = '';
+
+  function updateStatus(p, txt){
+    if (typeof p === 'number') progressEl.value = p;
+    if (txt) statusEl.textContent = txt;
+  }
+  function showError(e){
+    console.error(e);
+    errEl.textContent = (e && e.message) ? e.message : String(e);
+    updateStatus(0, '出错：' + (e && e.message ? e.message : '未知错误'));
+  }
+
+  // robust decode: try utf-8, else try some legacy encodings if TextDecoder supports them
+  async function robustDecode(arrayBuffer){
+    // try read as UTF-8 first
+    try {
+      const utf8 = new TextDecoder('utf-8', {fatal:false}).decode(new Uint8Array(arrayBuffer));
+      // if contains replacement characters heavily, try others
+      const repCount = (utf8.match(/\uFFFD/g)||[]).length;
+      if (repCount === 0) return {text:utf8, encoding:'utf-8'};
+      // else attempt gb18030 / gbk / big5 if supported
+      const candidates = ['gb18030','gbk','big5','iso-8859-1'];
+      for (const enc of candidates){
+        try{
+          const txt = new TextDecoder(enc, {fatal:false}).decode(new Uint8Array(arrayBuffer));
+          const bad = (txt.match(/\uFFFD/g)||[]).length;
+          // pick first with few replacement chars
+          if (bad < repCount) return {text:txt, encoding:enc};
+        }catch(e){ /* ignore */ }
+      }
+      return {text:utf8, encoding:'utf-8'};
+    } catch(e){
+      // fallback: try TextDecoder without fatal
+      try {
+        const fallback = new TextDecoder('utf-8').decode(new Uint8Array(arrayBuffer));
+        return {text:fallback, encoding:'utf-8'};
+      } catch(err){
+        throw new Error('无法解码文本：' + err.message);
+      }
+    }
+  }
+
+  // chapter splitting (keeps simple & robust)
+  function splitChapters(text){
+    // normalize newlines
+    text = text.replace(/\r\n?/g, '\n');
+    const lines = text.split('\n');
+    const idxs = [];
+    const re = new RegExp('^(?:\\s*)(?:第[一二三四五六七八九十百千0-9]+[章节回卷篇]|番外|^[0-9]{1,4}$)','m');
+    for (let i=0;i<lines.length;i++){
+      if (re.test(lines[i])) idxs.push(i);
+    }
+    const result = [];
+    if (idxs.length === 0){
+      // fallback: chunk every ~5000 chars
+      const chunk = 5000;
+      for (let s=0, n=1; s<text.length; s+=chunk, n++){
+        const end = Math.min(text.length, s+chunk);
+        result.push({title:'第' + n + '章', content: text.slice(s,end)});
+      }
+      return result;
+    }
+    for (let i=0;i<idxs.length;i++){
+      const start = idxs[i];
+      const end = (i+1<idxs.length) ? idxs[i+1] : lines.length;
+      // title is the matched line
+      const titleLine = lines[start].trim();
+      const body = lines.slice(start+1, end).join('\n').trim();
+      result.push({title: titleLine || ('第' + (i+1) + '章'), content: body});
+    }
+    // filter empty
+    return result.filter(ch => (ch.content||'').replace(/\s/g,'').length > 0);
+  }
+
+  // handle file selection
+  fileInput.addEventListener('change', async function(){
+    errEl.textContent = '';
+    previewDiv.style.display = 'none';
+    chaptersCache = null;
+    updateStatus(5, '检测到文件，正在读取...');
+
+    const f = this.files[0];
+    if (!f) {
+      updateStatus(0,'未选择文件');
+      return;
+    }
+
+    // try readAsText first (streaming-friendly in Safari)
+    try {
+      const fr = new FileReader();
+      fr.onload = async function(ev){
+        let text = ev.target.result;
+        // if empty/looks wrong (too few chars), try arrayBuffer + robustDecode
+        if ((typeof text !== 'string' || text.length < 2) && f.size > 0){
+          try{
+            updateStatus(15, 'UTF-8 读出内容异常，尝试二进制解码...');
+            const buffer = await f.arrayBuffer();
+            const dec = await robustDecode(buffer);
+            text = dec.text;
+            updateStatus(25, '使用编码：' + dec.encoding);
+          }catch(de){
+            showError(de); return;
+          }
+        }
+        lastText = text;
+        // parse chapters
+        updateStatus(40, '解析章节中...');
+        try {
+          chaptersCache = splitChapters(text);
+          document.getElementById('previewList').innerHTML = '';
+          chaptersCache.slice(0,5).forEach(ch=>{
+            const li = document.createElement('li'); li.textContent = ch.title; document.getElementById('previewList').appendChild(li);
+          });
+          document.getElementById('chapterCount').textContent = '共解析到 ' + chaptersCache.length + ' 章';
+          previewDiv.style.display = 'block';
+          previewBtn.disabled = false;
+          convertBtn.disabled = false;
+          updateStatus(50, '解析完成，可预览或转换');
+        } catch (pe) {
+          showError(pe);
+        }
       };
-      fr2.readAsText(f,"gbk");
-    } else {
-      decodedText=text;
-      afterLoad(f);
+      fr.onerror = function(e){
+        showError(new Error('FileReader 读取失败'));
+      };
+      // try utf-8 first; Safari will decode
+      fr.readAsText(f, 'utf-8');
+      // set a timeout guard: if nothing happens in 8s, try arrayBuffer fallback
+      const guard = setTimeout(async ()=>{
+        if (!lastText){
+          try {
+            updateStatus(12, '读超时，尝试二进制解码...');
+            const buffer = await f.arrayBuffer();
+            const dec = await robustDecode(buffer);
+            lastText = dec.text;
+            chaptersCache = splitChapters(lastText);
+            document.getElementById('previewList').innerHTML = '';
+            chaptersCache.slice(0,5).forEach(ch=>{
+              const li = document.createElement('li'); li.textContent = ch.title; document.getElementById('previewList').appendChild(li);
+            });
+            document.getElementById('chapterCount').textContent = '共解析到 ' + chaptersCache.length + ' 章';
+            previewDiv.style.display = 'block';
+            previewBtn.disabled = false;
+            convertBtn.disabled = false;
+            updateStatus(50, '解析完成（后备解码）');
+          } catch (e) { showError(e); }
+        }
+      }, 8000);
+    } catch (e){
+      showError(e);
     }
-  };
-  reader.readAsText(f,"utf-8");
-});
-
-// 文件读完 → 解析章节
-function afterLoad(f){
-  status.textContent='解析章节中…';
-  progress.value=20;
-  chapters=splitChapters(decodedText,getChapterRegex());
-  preview.textContent=`检测到 ${chapters.length} 章。\n前5章：\n`+
-    chapters.slice(0,5).map(c=>c.title).join('\n');
-  convertBtn.disabled=false;
-  testBtn.disabled=false;
-  status.textContent='就绪';
-  progress.value=30;
-}
-
-// 测试规则
-testBtn.addEventListener('click',()=>{
-  if(!decodedText){alert('请先选择文件');return;}
-  const re=getChapterRegex();
-  const testChapters=splitChapters(decodedText,re);
-  preview.textContent=`测试规则结果：共 ${testChapters.length} 章\n`+
-    testChapters.map((c,i)=>`${i+1}. ${c.title}`).join('\n');
-  status.textContent='规则测试完成 ✅';
-});
-
-// 转换
-convertBtn.addEventListener('click',async()=>{
-  if(!decodedText){alert('请先选择文件');return;}
-  const bookTitle=titleInput.value.trim()||fileInput.files[0].name.replace(/\.txt$/i,'');
-  const bookAuthor=authorInput.value.trim()||'佚名';
-  progress.value=40;status.textContent='开始转换…';
-  const zip=new JSZip();
-  zip.file('mimetype','application/epub+zip',{compression:'STORE'});
-  zip.file('META-INF/container.xml',
-`<?xml version="1.0"?>
-<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
- <rootfiles>
-  <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
- </rootfiles>
-</container>`);
-  progress.value=50;status.textContent='写入章节…';
-  chapters.forEach((c,i)=>{
-    zip.file(`OEBPS/${c.id}.xhtml`,
-`<?xml version="1.0" encoding="utf-8"?>
-<html xmlns="http://www.w3.org/1999/xhtml"><body>
-<p style="font-weight:bold;">${c.title}</p>
-<p>${c.content.replace(/\n+/g,'</p><p>')}</p>
-</body></html>`);
-    if(i%20===0)progress.value=50+Math.floor(i/chapters.length*20);
   });
-  progress.value=70;status.textContent='生成目录…';
-  zip.file('OEBPS/nav.xhtml',
-`<?xml version="1.0" encoding="utf-8"?>
-<html xmlns="http://www.w3.org/1999/xhtml"><body><nav><ol>
-${chapters.map(c=>`<li><a href="${c.id}.xhtml">${c.title}</a></li>`).join('\n')}
-</ol></nav></body></html>`);
-  zip.file('OEBPS/content.opf',
-`<?xml version="1.0" encoding="utf-8"?>
-<package version="3.0" xmlns="http://www.idpf.org/2007/opf">
- <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-  <dc:title>${bookTitle}</dc:title>
-  <dc:creator>${bookAuthor}</dc:creator>
-  <dc:language>zh-CN</dc:language>
- </metadata>
- <manifest>
-  ${chapters.map(c=>`<item id="${c.id}" href="${c.id}.xhtml" media-type="application/xhtml+xml"/>`).join('\n')}
-  <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
- </manifest>
- <spine>
-  ${chapters.map(c=>`<itemref idref="${c.id}"/>`).join('\n')}
-  <itemref idref="nav"/>
- </spine>
-</package>`);
-  progress.value=85;status.textContent='打包…';
-  const blob=await zip.generateAsync({type:"blob"},meta=>{
-    progress.value=85+Math.floor((meta.percent||0)*0.15);
+
+  previewBtn.addEventListener('click', function(){
+    if (!chaptersCache) { alert('无可预览内容'); return; }
+    // already rendered list; just scroll to it
+    previewDiv.scrollIntoView({behavior:'smooth'});
   });
-  const url=URL.createObjectURL(blob);
-  const a=document.createElement('a');
-  a.href=url;
-  a.download=bookTitle+'.epub';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-  progress.value=100;status.textContent='完成 ✅';
-}
 
-// 章节规则
-function getChapterRegex(){
-  const rules=rulesInput.value.split(',').map(r=>r.trim()).filter(Boolean);
-  return new RegExp(`^(?:\\s*)(?:${rules.join('|')})([：:\\.\\s\\-—]*[^\\n]{0,80})?`,'m');
-}
+  // build epub and download
+  convertBtn.addEventListener('click', async function(){
+    if (!chaptersCache || chaptersCache.length === 0) { alert('请先上传并解析 TXT'); return; }
+    updateStatus(55, '开始构建 EPUB ...');
+    try{
+      const zip = new JSZip();
+      zip.file('mimetype','application/epub+zip', {compression:'STORE'});
+      zip.folder('META-INF').file('container.xml',
+        `<?xml version="1.0" encoding="utf-8"?>
+        <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+          <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+        </container>`
+      );
+      // manifest / spine (epub2 compatible)
+      const title = (titleInput.value || 'book').replace(/<\/?[^>]+(>|$)/g, "");
+      const ncx = `<?xml version="1.0" encoding="utf-8"?>
+      <ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+        <head><meta name="dtb:uid" content="id"/></head>
+        <docTitle><text>${title}</text></docTitle>
+        <navMap>${chaptersCache.map((c,i)=>`
+          <navPoint id="nav${i}" playOrder="${i+1}">
+            <navLabel><text>${c.title}</text></navLabel>
+            <content src="chapter${i}.xhtml"/>
+          </navPoint>`).join('')}
+        </navMap>
+      </ncx>`;
+      zip.folder('OEBPS').file('toc.ncx', ncx);
 
-// 切分章节
-function splitChapters(text,re){
-  const lines=text.split(/\r?\n/);const idxs=[];
-  for(let i=0;i<lines.length;i++){
-    const m=lines[i].match(re);if(m){
-      const title=(m[0]||'').trim();
-      idxs.push({line:i,title});
+      const opf = `<?xml version="1.0" encoding="utf-8"?>
+      <package version="2.0" unique-identifier="id" xmlns="http://www.idpf.org/2007/opf">
+        <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+          <dc:title>${title}</dc:title>
+          <dc:language>zh-CN</dc:language>
+          <dc:identifier id="id">id</dc:identifier>
+        </metadata>
+        <manifest>
+          <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+          ${chaptersCache.map((c,i)=>`<item id="chap${i}" href="chapter${i}.xhtml" media-type="application/xhtml+xml"/>`).join('')}
+        </manifest>
+        <spine toc="ncx">
+          ${chaptersCache.map((c,i)=>`<itemref idref="chap${i}"/>`).join('')}
+        </spine>
+      </package>`;
+      zip.folder('OEBPS').file('content.opf', opf);
+
+      chaptersCache.forEach((ch,i)=>{
+        // title bold but same size
+        const body = (ch.content||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g, '<br/>');
+        const xhtml = `<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head><meta charset="utf-8"/><title>${ch.title}</title></head>
+  <body><p style="font-weight:bold;margin:0 0 .6em 0;">${ch.title}</p><div>${body}</div></body>
+</html>`;
+        zip.folder('OEBPS').file(`chapter${i}.xhtml`, xhtml);
+      });
+
+      updateStatus(80, '打包中...');
+      const blob = await zip.generateAsync({type:'blob'}, (meta)=> {
+        updateStatus(Math.min(95, 80 + Math.floor(meta.percent * 0.15)), '打包中... ' + Math.floor(meta.percent) + '%');
+      });
+
+      // trigger download via FileSaver
+      const fname = title + '.epub';
+      saveAs(blob, fname);
+      updateStatus(100, '完成：已触发下载（检查 文件App 或 图书）');
+    } catch(e){
+      showError(e);
     }
-  }
-  const result=[];for(let i=0;i<idxs.length;i++){
-    const cur=idxs[i],next=idxs[i+1];
-    const body=lines.slice(cur.line+1,next?next.line:lines.length).join('\n').trim();
-    result.push({id:'ch'+(i+1),title:cur.title,content:body});
-  }
-  return result.length?result:[{id:'ch1',title:'全文',content:text}];
-}
+  });
+
+  // global error catcher to show on page
+  window.addEventListener('error', function(ev){
+    showError(ev.error || ev.message || '未知脚本错误');
+  });
+})();
 </script>
 </body>
 </html>
